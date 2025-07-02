@@ -206,7 +206,7 @@ class ReocitiesCLI:
         for i in range(0, len(files_to_upload), 10):
             batch = files_to_upload[i:i+10]
             
-            try
+            try:
                 files_data = []
                 for file_path, relative_path in batch:
                     files_data.append((file_path, relative_path))
