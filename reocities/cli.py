@@ -13,7 +13,7 @@ import configparser
 from typing import Optional, List
 import fnmatch
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 class ReocitiesConfig:
     def __init__(self):
@@ -54,62 +54,183 @@ class ReocitiesAPI:
             'User-Agent': f'reocities-cli/{__version__}'
         })
     
+    def _handle_response(self, response: requests.Response) -> dict:
+        """Handle API response and parse JSON safely"""
+        try:
+            if not response.text.strip():
+                return {'error': f'Empty response from server (HTTP {response.status_code})'}
+            
+            data = response.json()
+            
+            if response.status_code >= 400:
+                if isinstance(data, dict) and 'error' not in data:
+                    data['error'] = f'HTTP {response.status_code}: {response.reason}'
+            
+            return data
+            
+        except json.JSONDecodeError:
+            return {
+                'error': f'Invalid JSON response (HTTP {response.status_code})',
+                'raw_response': response.text[:500] 
+            }
+        except Exception as e:
+            return {'error': f'Unexpected error parsing response: {str(e)}'}
+    
     def upload_file(self, file_path: Path, remote_path: str = None, overwrite: bool = True) -> dict:
         """Upload a single file"""
         if not file_path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
         
-        with open(file_path, 'rb') as f:
-            files = {'file': (file_path.name, f, mimetypes.guess_type(str(file_path))[0])}
-            data = {'overwrite': str(overwrite).lower()}
+        try:
+            import urllib3
+            import urllib.parse
+            
+            file_content = file_path.read_bytes()
+            mime_type = mimetypes.guess_type(str(file_path))[0] or 'application/octet-stream'
+            
+            fields = {
+                'overwrite': str(overwrite).lower(),
+                'file': (file_path.name, file_content, mime_type)
+            }
             
             if remote_path:
-                data['folder'] = remote_path
+                fields['folder'] = remote_path
             
-            response = self.session.post(f"{self.base_url}/api/upload", files=files, data=data)
-            return response.json()
+            encoded_data, content_type = urllib3.filepost.encode_multipart_formdata(fields)
+            
+            headers = {
+                'Content-Type': content_type,
+                'X-API-Key': self.api_key,
+                'User-Agent': f'reocities-cli/{__version__}'
+            }
+            
+            http = urllib3.PoolManager()
+            response = http.request('POST', f"{self.base_url}/api/upload", body=encoded_data, headers=headers)
+            
+            response_data = {
+                'status_code': response.status,
+                'text': response.data.decode('utf-8'),
+                'headers': dict(response.headers)
+            }
+            
+            if response.status >= 400:
+                return {'error': f'HTTP {response.status}: {response_data["text"]}'}
+            
+            try:
+                return json.loads(response_data['text'])
+            except json.JSONDecodeError:
+                return {'error': 'Invalid JSON response', 'raw_response': response_data['text'][:500]}
+                
+        except Exception as e:
+            return {'error': f'Upload failed: {str(e)}'}
     
     def upload_files_bulk(self, files: List[tuple], folder: str = None, overwrite: bool = True) -> dict:
         """Upload multiple files at once (max 10)"""
         if len(files) > 10:
             raise ValueError("Maximum 10 files per bulk upload")
         
-        files_data = []
-        for file_path, filename in files:
-            with open(file_path, 'rb') as f:
-                files_data.append(('files[]', (filename, f.read(), mimetypes.guess_type(str(file_path))[0])))
-        
-        data = {'overwrite': str(overwrite).lower()}
-        if folder:
-            data['folder'] = folder
-        
-        response = self.session.post(f"{self.base_url}/api/upload/bulk", files=files_data, data=data)
-        return response.json()
+        try:
+            import urllib3
+            
+            fields = {'overwrite': str(overwrite).lower()}
+            if folder:
+                fields['folder'] = folder
+            
+            for file_path, filename in files:
+                file_content = Path(file_path).read_bytes()
+                if len(file_content) == 0:
+                    return {'error': f'File {filename} is empty'}
+                
+                mime_type = mimetypes.guess_type(str(file_path))[0]
+                if not mime_type:
+                    ext = Path(file_path).suffix.lower()
+                    if ext == '.html':
+                        mime_type = 'text/html'
+                    elif ext == '.css':
+                        mime_type = 'text/css'
+                    elif ext == '.js':
+                        mime_type = 'text/javascript'
+                    elif ext == '.txt':
+                        mime_type = 'text/plain'
+                    else:
+                        mime_type = 'application/octet-stream'
+                
+                fields['files[]'] = (filename, file_content, mime_type)
+            
+            encoded_data, content_type = urllib3.filepost.encode_multipart_formdata(fields)
+            
+            headers = {
+                'Content-Type': content_type,
+                'X-API-Key': self.api_key,
+                'User-Agent': f'reocities-cli/{__version__}'
+            }
+            
+            http = urllib3.PoolManager()
+            response = http.request('POST', f"{self.base_url}/api/bulk-upload", body=encoded_data, headers=headers)
+            
+            if response.status >= 400:
+                return {'error': f'HTTP {response.status}: {response.data.decode("utf-8")}'}
+            
+            try:
+                return json.loads(response.data.decode('utf-8'))
+            except json.JSONDecodeError:
+                return {'error': 'Invalid JSON response', 'raw_response': response.data.decode('utf-8')[:500]}
+                
+        except Exception as e:
+            return {'error': f'Bulk upload failed: {str(e)}'}
     
     def list_files(self, folder: str = None, recursive: bool = False) -> dict:
         """List files on the site"""
-        params = {}
-        if folder:
-            params['folder'] = folder
-        if recursive:
-            params['recursive'] = 'true'
-        
-        response = self.session.get(f"{self.base_url}/api/files", params=params)
-        return response.json()
+        try:
+            params = {}
+            if folder:
+                params['folder'] = folder
+            if recursive:
+                params['recursive'] = 'true'
+            
+            response = self.session.get(f"{self.base_url}/api/files", params=params)
+            return self._handle_response(response)
+        except Exception as e:
+            return {'error': f'List files failed: {str(e)}'}
     
     def delete_file(self, path: str) -> dict:
         """Delete a file or folder"""
-        response = self.session.delete(f"{self.base_url}/api/files", data={'path': path})
-        return response.json()
+        try:
+            import urllib3
+            
+            data = json.dumps({'path': path})
+            
+            headers = {
+                'Content-Type': 'application/json',
+                'X-API-Key': self.api_key,
+                'User-Agent': f'reocities-cli/{__version__}'
+            }
+            
+            http = urllib3.PoolManager()
+            response = http.request('DELETE', f"{self.base_url}/api/files", body=data, headers=headers)
+            
+            if response.status >= 400:
+                return {'error': f'HTTP {response.status}: {response.data.decode("utf-8")}'}
+            
+            try:
+                return json.loads(response.data.decode('utf-8'))
+            except json.JSONDecodeError:
+                return {'error': 'Invalid JSON response', 'raw_response': response.data.decode('utf-8')[:500]}
+                
+        except Exception as e:
+            return {'error': f'Delete failed: {str(e)}'}
     
     def create_folder(self, name: str, parent: str = None) -> dict:
         """Create a new folder"""
-        data = {'name': name}
-        if parent:
-            data['parent'] = parent
-        
-        response = self.session.post(f"{self.base_url}/api/folders", data=data)
-        return response.json()
+        try:
+            data = {'name': name}
+            if parent:
+                data['parent'] = parent
+            
+            response = self.session.post(f"{self.base_url}/api/folders", data=data)
+            return self._handle_response(response)
+        except Exception as e:
+            return {'error': f'Create folder failed: {str(e)}'}
 
 class ReocitiesCLI:
     def __init__(self):
@@ -141,15 +262,13 @@ class ReocitiesCLI:
     
     def login(self, api_key: str):
         """Login with API key"""
-        # testing the API key
         test_api = ReocitiesAPI(api_key)
-        try:
-            result = test_api.list_files()
-            if 'error' in result:
-                print(f"Error: {result['error']}")
-                return False
-        except Exception as e:
-            print(f"Error: Failed to connect with API key: {e}")
+        result = test_api.list_files()
+        
+        if 'error' in result:
+            print(f"Error: {result['error']}")
+            if 'raw_response' in result:
+                print(f"Server response: {result['raw_response']}")
             return False
         
         self.config.save_config(api_key)
@@ -199,37 +318,38 @@ class ReocitiesCLI:
         
         print(f"Found {len(files_to_upload)} files to upload...")
         
-        # batches of 10
         uploaded_count = 0
         failed_count = 0
         
         for i in range(0, len(files_to_upload), 10):
             batch = files_to_upload[i:i+10]
             
-            try:
-                files_data = []
-                for file_path, relative_path in batch:
-                    files_data.append((file_path, relative_path))
+            files_data = []
+            for file_path, relative_path in batch:
+                files_data.append((file_path, relative_path))
+            
+            result = self.api.upload_files_bulk(files_data)
+            
+            if 'error' in result:
+                print(f"Error uploading batch: {result['error']}")
+                if 'raw_response' in result:
+                    print(f"Server response: {result['raw_response']}")
+                failed_count += len(batch)
+                continue
+            
+            if result.get('success'):
+                batch_uploaded = len(result.get('uploaded', []))
+                batch_failed = len(result.get('failed', []))
+                uploaded_count += batch_uploaded
+                failed_count += batch_failed
                 
-                result = self.api.upload_files_bulk(files_data)
+                for file_info in result.get('uploaded', []):
+                    print(f"✓ {file_info.get('path', file_info.get('filename', 'unknown'))}")
                 
-                if result.get('success'):
-                    batch_uploaded = len(result.get('uploaded', []))
-                    batch_failed = len(result.get('failed', []))
-                    uploaded_count += batch_uploaded
-                    failed_count += batch_failed
-                    
-                    for file_info in result.get('uploaded', []):
-                        print(f"✓ {file_info['path']}")
-                    
-                    for file_info in result.get('failed', []):
-                        print(f"✗ {file_info['filename']}: {file_info.get('error', 'Unknown error')}")
-                else:
-                    print(f"Error uploading batch: {result.get('message', 'Unknown error')}")
-                    failed_count += len(batch)
-                    
-            except Exception as e:
-                print(f"Error uploading batch: {e}")
+                for file_info in result.get('failed', []):
+                    print(f"✗ {file_info.get('filename', 'unknown')}: {file_info.get('error', 'Unknown error')}")
+            else:
+                print(f"Error uploading batch: {result.get('message', 'Unknown error')}")
                 failed_count += len(batch)
         
         print(f"\nUpload complete: {uploaded_count} succeeded, {failed_count} failed")
@@ -245,37 +365,51 @@ class ReocitiesCLI:
                 print(f"Error: File '{file_path_str}' does not exist")
                 continue
             
-            try:
-                result = self.api.upload_file(file_path, folder)
-                if result.get('success'):
-                    print(f"✓ Uploaded {result['filename']} to {result['path']}")
-                else:
-                    print(f"✗ Failed to upload {file_path.name}: {result.get('message', 'Unknown error')}")
-            except Exception as e:
-                print(f"✗ Error uploading {file_path.name}: {e}")
+            result = self.api.upload_file(file_path, folder)
+            
+            if 'error' in result:
+                print(f"✗ Failed to upload {file_path.name}: {result['error']}")
+                if 'raw_response' in result:
+                    print(f"Server response: {result['raw_response']}")
+            elif result.get('success'):
+                print(f"✓ Uploaded {result.get('filename', file_path.name)} to {result.get('path', 'unknown path')}")
+            else:
+                print(f"✗ Failed to upload {file_path.name}: {result.get('message', 'Unknown error')}")
     
     def list_files(self, folder: str = None, recursive: bool = False):
         """List files on the site"""
         if not self.ensure_authenticated():
             return
         
-        try:
-            result = self.api.list_files(folder, recursive)
-            if result.get('success'):
-                files = result.get('files', [])
-                if not files:
-                    print("No files found")
-                    return
+        result = self.api.list_files(folder, recursive)
+        
+        if 'error' in result:
+            print(f"Error: {result['error']}")
+            if 'raw_response' in result:
+                print(f"Server response: {result['raw_response']}")
+            return
+        
+        if result.get('success'):
+            files = result.get('files', [])
+            if not files:
+                print("No files found")
+                return
+            
+            print(f"Files in {'/' + folder if folder else 'root'}:")
+            for file_info in files:
+                size = file_info.get('size')
+                if size is not None and isinstance(size, (int, float)):
+                    if size < 1024:
+                        size_str = f"{size:,} bytes"
+                    else:
+                        size_str = f"{size/1024:.1f} KB"
+                else:
+                    size_str = "unknown size"
                 
-                print(f"Files in {'/' + folder if folder else 'root'}:")
-                for file_info in files:
-                    size = file_info.get('size', 0)
-                    size_str = f"{size:,} bytes" if size < 1024 else f"{size/1024:.1f} KB"
-                    print(f"  {file_info.get('path', file_info.get('name'))} ({size_str})")
-            else:
-                print(f"Error: {result.get('message', 'Unknown error')}")
-        except Exception as e:
-            print(f"Error listing files: {e}")
+                file_path = file_info.get('path', file_info.get('name', 'unknown'))
+                print(f"  {file_path} ({size_str})")
+        else:
+            print(f"Error: {result.get('message', 'Unknown error')}")
     
     def delete(self, paths: List[str]):
         """Delete files from the site"""
@@ -283,14 +417,16 @@ class ReocitiesCLI:
             return
         
         for path in paths:
-            try:
-                result = self.api.delete_file(path)
-                if result.get('success'):
-                    print(f"✓ Deleted {path}")
-                else:
-                    print(f"✗ Failed to delete {path}: {result.get('message', 'Unknown error')}")
-            except Exception as e:
-                print(f"✗ Error deleting {path}: {e}")
+            result = self.api.delete_file(path)
+            
+            if 'error' in result:
+                print(f"✗ Failed to delete {path}: {result['error']}")
+                if 'raw_response' in result:
+                    print(f"Server response: {result['raw_response']}")
+            elif result.get('success'):
+                print(f"✓ Deleted {path}")
+            else:
+                print(f"✗ Failed to delete {path}: {result.get('message', 'Unknown error')}")
 
 def print_banner():
     """Print the Reocities CLI banner"""
