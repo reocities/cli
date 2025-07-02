@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reocities-cli"
+version = "1.0.0"
+description = "Command line interface for managing your Reocities site"
+readme = "README.md"
+requires-python = ">=3.6"
+license = {text = "MIT"}
+authors = [
+    {name = "Reocities", email = "support@reocities.xyz"}
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.6",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+]
+dependencies = [
+    "requests>=2.25.0"
+]
+
+[project.urls]
+Homepage = "https://reocities.xyz"
+Repository = "https://github.com/reocities/cli"
+Documentation = "https://reocities.xyz/cli"
+
+[project.scripts]
+reocities = "reocities.cli:main"
