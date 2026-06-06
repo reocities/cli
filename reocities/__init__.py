@@ -1,2 +1,2 @@
-"""Reocities CLI - Command line interface for managing your Reocities site"""
-__version__ = "1.0.1"
+"""Reocities CLI - manage your Reocities site from the terminal."""
+__version__ = "2.0.0"

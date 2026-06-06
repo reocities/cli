@@ -1,497 +1,491 @@
 #!/usr/bin/env python3
-"""
-Reocities CLI - Command line interface for managing your Reocities site
-"""
+"""Reocities CLI - manage your Reocities site from the terminal."""
 import os
 import sys
 import json
-import requests
 import argparse
-import mimetypes
-from pathlib import Path
-import configparser
-from typing import Optional, List
 import fnmatch
+import webbrowser
+import configparser
+from pathlib import Path
 
-__version__ = "1.0.1"
+import requests
 
-class ReocitiesConfig:
+__version__ = "2.0.0"
+
+# Use the canonical www host. reocities.xyz 301-redirects to www, and a 301 turns
+# a POST upload into a GET, which the API rejects - so target www directly.
+DEFAULT_BASE_URL = "https://www.reocities.xyz"
+BULK_BATCH_SIZE = 10
+IGNORE_FILES = (".gitignore", ".reocitiesignore")
+
+
+class Config:
+    """Reads and writes ~/.reocities/config."""
+
     def __init__(self):
-        self.config_dir = Path.home() / '.reocities'
-        self.config_file = self.config_dir / 'config'
-        self.config_dir.mkdir(exist_ok=True)
-        
-    def load_config(self) -> Optional[str]:
-        """Load API key from config file"""
-        if not self.config_file.exists():
-            return None
-        
-        config = configparser.ConfigParser()
-        config.read(self.config_file)
-        
-        try:
-            return config['default']['api_key']
-        except KeyError:
-            return None
-    
-    def save_config(self, api_key: str):
-        """Save API key to config file"""
-        config = configparser.ConfigParser()
-        config['default'] = {'api_key': api_key}
-        
-        with open(self.config_file, 'w') as f:
-            config.write(f)
-        
-        os.chmod(self.config_file, 0o600)
+        self.dir = Path.home() / ".reocities"
+        self.file = self.dir / "config"
 
-class ReocitiesAPI:
-    def __init__(self, api_key: str, base_url: str = "https://reocities.xyz"):
+    def read(self):
+        if not self.file.exists():
+            return {}
+        parser = configparser.ConfigParser()
+        parser.read(self.file)
+        if "default" not in parser:
+            return {}
+        return dict(parser["default"])
+
+    def write(self, api_key, base_url=DEFAULT_BASE_URL):
+        self.dir.mkdir(exist_ok=True)
+        parser = configparser.ConfigParser()
+        parser["default"] = {"api_key": api_key, "base_url": base_url}
+        with open(self.file, "w") as fh:
+            parser.write(fh)
+        # Best effort on POSIX; chmod is a no-op worth skipping if it fails on Windows.
+        try:
+            os.chmod(self.file, 0o600)
+        except OSError:
+            pass
+
+    def clear(self):
+        if self.file.exists():
+            self.file.unlink()
+            return True
+        return False
+
+
+class Client:
+    """Thin wrapper over the Reocities HTTP API."""
+
+    def __init__(self, api_key, base_url=DEFAULT_BASE_URL):
         self.api_key = api_key
-        self.base_url = base_url
+        self.base_url = base_url.rstrip("/")
         self.session = requests.Session()
         self.session.headers.update({
-            'X-API-Key': api_key,
-            'User-Agent': f'reocities-cli/{__version__}'
+            "X-API-Key": api_key,
+            "User-Agent": f"reocities-cli/{__version__}",
         })
-    
-    def _handle_response(self, response: requests.Response) -> dict:
-        """Handle API response and parse JSON safely"""
+
+    def _url(self, path):
+        return f"{self.base_url}{path}"
+
+    @staticmethod
+    def _parse(response):
+        if not response.content:
+            return {"error": f"empty response (HTTP {response.status_code})"}
         try:
-            if not response.text.strip():
-                return {'error': f'Empty response from server (HTTP {response.status_code})'}
-            
             data = response.json()
-            
-            if response.status_code >= 400:
-                if isinstance(data, dict) and 'error' not in data:
-                    data['error'] = f'HTTP {response.status_code}: {response.reason}'
-            
-            return data
-            
-        except json.JSONDecodeError:
-            return {
-                'error': f'Invalid JSON response (HTTP {response.status_code})',
-                'raw_response': response.text[:500] 
-            }
-        except Exception as e:
-            return {'error': f'Unexpected error parsing response: {str(e)}'}
-    
-    def upload_file(self, file_path: Path, remote_path: str = None, overwrite: bool = True) -> dict:
-        """Upload a single file"""
-        if not file_path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
-        
-        try:
-            import urllib3
-            import urllib.parse
-            
-            file_content = file_path.read_bytes()
-            mime_type = mimetypes.guess_type(str(file_path))[0] or 'application/octet-stream'
-            
-            fields = {
-                'overwrite': str(overwrite).lower(),
-                'file': (file_path.name, file_content, mime_type)
-            }
-            
-            if remote_path:
-                fields['folder'] = remote_path
-            
-            encoded_data, content_type = urllib3.filepost.encode_multipart_formdata(fields)
-            
-            headers = {
-                'Content-Type': content_type,
-                'X-API-Key': self.api_key,
-                'User-Agent': f'reocities-cli/{__version__}'
-            }
-            
-            http = urllib3.PoolManager()
-            response = http.request('POST', f"{self.base_url}/api/upload", body=encoded_data, headers=headers)
-            
-            response_data = {
-                'status_code': response.status,
-                'text': response.data.decode('utf-8'),
-                'headers': dict(response.headers)
-            }
-            
-            if response.status >= 400:
-                return {'error': f'HTTP {response.status}: {response_data["text"]}'}
-            
-            try:
-                return json.loads(response_data['text'])
-            except json.JSONDecodeError:
-                return {'error': 'Invalid JSON response', 'raw_response': response_data['text'][:500]}
-                
-        except Exception as e:
-            return {'error': f'Upload failed: {str(e)}'}
-    
-    def upload_files_bulk(self, files: List[tuple], folder: str = None, overwrite: bool = True) -> dict:
-        """Upload multiple files at once (max 10)"""
-        if len(files) > 10:
-            raise ValueError("Maximum 10 files per bulk upload")
-        
-        try:
-            import urllib3
-            
-            fields = {'overwrite': str(overwrite).lower()}
-            if folder:
-                fields['folder'] = folder
-            
-            for file_path, filename in files:
-                file_content = Path(file_path).read_bytes()
-                if len(file_content) == 0:
-                    return {'error': f'File {filename} is empty'}
-                
-                mime_type = mimetypes.guess_type(str(file_path))[0]
-                if not mime_type:
-                    ext = Path(file_path).suffix.lower()
-                    if ext == '.html':
-                        mime_type = 'text/html'
-                    elif ext == '.css':
-                        mime_type = 'text/css'
-                    elif ext == '.js':
-                        mime_type = 'text/javascript'
-                    elif ext == '.txt':
-                        mime_type = 'text/plain'
-                    else:
-                        mime_type = 'application/octet-stream'
-                
-                fields['files[]'] = (filename, file_content, mime_type)
-            
-            encoded_data, content_type = urllib3.filepost.encode_multipart_formdata(fields)
-            
-            headers = {
-                'Content-Type': content_type,
-                'X-API-Key': self.api_key,
-                'User-Agent': f'reocities-cli/{__version__}'
-            }
-            
-            http = urllib3.PoolManager()
-            response = http.request('POST', f"{self.base_url}/api/bulk-upload", body=encoded_data, headers=headers)
-            
-            if response.status >= 400:
-                return {'error': f'HTTP {response.status}: {response.data.decode("utf-8")}'}
-            
-            try:
-                return json.loads(response.data.decode('utf-8'))
-            except json.JSONDecodeError:
-                return {'error': 'Invalid JSON response', 'raw_response': response.data.decode('utf-8')[:500]}
-                
-        except Exception as e:
-            return {'error': f'Bulk upload failed: {str(e)}'}
-    
-    def list_files(self, folder: str = None, recursive: bool = False) -> dict:
-        """List files on the site"""
-        try:
-            params = {}
-            if folder:
-                params['folder'] = folder
-            if recursive:
-                params['recursive'] = 'true'
-            
-            response = self.session.get(f"{self.base_url}/api/files", params=params)
-            return self._handle_response(response)
-        except Exception as e:
-            return {'error': f'List files failed: {str(e)}'}
-    
-    def delete_file(self, path: str) -> dict:
-        """Delete a file or folder"""
-        try:
-            import urllib3
-            
-            data = json.dumps({'path': path})
-            
-            headers = {
-                'Content-Type': 'application/json',
-                'X-API-Key': self.api_key,
-                'User-Agent': f'reocities-cli/{__version__}'
-            }
-            
-            http = urllib3.PoolManager()
-            response = http.request('DELETE', f"{self.base_url}/api/files", body=data, headers=headers)
-            
-            if response.status >= 400:
-                return {'error': f'HTTP {response.status}: {response.data.decode("utf-8")}'}
-            
-            try:
-                return json.loads(response.data.decode('utf-8'))
-            except json.JSONDecodeError:
-                return {'error': 'Invalid JSON response', 'raw_response': response.data.decode('utf-8')[:500]}
-                
-        except Exception as e:
-            return {'error': f'Delete failed: {str(e)}'}
-    
-    def create_folder(self, name: str, parent: str = None) -> dict:
-        """Create a new folder"""
-        try:
-            data = {'name': name}
-            if parent:
-                data['parent'] = parent
-            
-            response = self.session.post(f"{self.base_url}/api/folders", data=data)
-            return self._handle_response(response)
-        except Exception as e:
-            return {'error': f'Create folder failed: {str(e)}'}
+        except ValueError:
+            return {"error": f"non-JSON response (HTTP {response.status_code})",
+                    "raw": response.text[:500]}
+        if response.status_code >= 400 and "error" not in data:
+            data["error"] = f"HTTP {response.status_code}"
+        return data
 
-class ReocitiesCLI:
-    def __init__(self):
-        self.config = ReocitiesConfig()
-        self.api = None
-        
-    def load_gitignore(self, directory: Path) -> List[str]:
-        """Load .gitignore patterns"""
-        gitignore_file = directory / '.gitignore'
-        if not gitignore_file.exists():
-            return []
-        
-        patterns = []
-        with open(gitignore_file, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#'):
-                    patterns.append(line)
-        return patterns
-    
-    def should_ignore(self, file_path: Path, gitignore_patterns: List[str], base_dir: Path) -> bool:
-        """Check if file should be ignored based on gitignore patterns"""
-        relative_path = file_path.relative_to(base_dir)
-        
-        for pattern in gitignore_patterns:
-            if fnmatch.fnmatch(str(relative_path), pattern) or fnmatch.fnmatch(file_path.name, pattern):
-                return True
-        return False
-    
-    def login(self, api_key: str):
-        """Login with API key"""
-        test_api = ReocitiesAPI(api_key)
-        result = test_api.list_files()
-        
-        if 'error' in result:
-            print(f"Error: {result['error']}")
-            if 'raw_response' in result:
-                print(f"Server response: {result['raw_response']}")
-            return False
-        
-        self.config.save_config(api_key)
-        print("Successfully logged in!")
-        return True
-    
-    def logout(self):
-        """Remove stored API key"""
-        if self.config.config_file.exists():
-            self.config.config_file.unlink()
-            print("Logged out successfully")
-        else:
-            print("Not currently logged in")
-    
-    def ensure_authenticated(self) -> bool:
-        """Ensure user is authenticated"""
-        api_key = self.config.load_config()
-        if not api_key:
-            print("Error: Not logged in. Please run 'reocities login <your-api-key>' first.")
-            return False
-        
-        self.api = ReocitiesAPI(api_key)
-        return True
-    
-    def push(self, directory: str):
-        """Push entire directory to site"""
-        if not self.ensure_authenticated():
-            return
-        
-        dir_path = Path(directory).resolve()
-        if not dir_path.exists() or not dir_path.is_dir():
-            print(f"Error: Directory '{directory}' does not exist")
-            return
-        
-        gitignore_patterns = self.load_gitignore(dir_path)
-        
-        files_to_upload = []
-        for file_path in dir_path.rglob('*'):
-            if file_path.is_file():
-                if not self.should_ignore(file_path, gitignore_patterns, dir_path):
-                    relative_path = file_path.relative_to(dir_path)
-                    files_to_upload.append((file_path, str(relative_path)))
-        
-        if not files_to_upload:
-            print("No files to upload")
-            return
-        
-        print(f"Found {len(files_to_upload)} files to upload...")
-        
-        uploaded_count = 0
-        failed_count = 0
-        
-        for i in range(0, len(files_to_upload), 10):
-            batch = files_to_upload[i:i+10]
-            
-            files_data = []
-            for file_path, relative_path in batch:
-                files_data.append((file_path, relative_path))
-            
-            result = self.api.upload_files_bulk(files_data)
-            
-            if 'error' in result:
-                print(f"Error uploading batch: {result['error']}")
-                if 'raw_response' in result:
-                    print(f"Server response: {result['raw_response']}")
-                failed_count += len(batch)
-                continue
-            
-            if result.get('success'):
-                batch_uploaded = len(result.get('uploaded', []))
-                batch_failed = len(result.get('failed', []))
-                uploaded_count += batch_uploaded
-                failed_count += batch_failed
-                
-                for file_info in result.get('uploaded', []):
-                    print(f"✓ {file_info.get('path', file_info.get('filename', 'unknown'))}")
-                
-                for file_info in result.get('failed', []):
-                    print(f"✗ {file_info.get('filename', 'unknown')}: {file_info.get('error', 'Unknown error')}")
-            else:
-                print(f"Error uploading batch: {result.get('message', 'Unknown error')}")
-                failed_count += len(batch)
-        
-        print(f"\nUpload complete: {uploaded_count} succeeded, {failed_count} failed")
-    
-    def upload(self, files: List[str], folder: str = None):
-        """Upload individual files"""
-        if not self.ensure_authenticated():
-            return
-        
-        for file_path_str in files:
-            file_path = Path(file_path_str)
-            if not file_path.exists():
-                print(f"Error: File '{file_path_str}' does not exist")
-                continue
-            
-            result = self.api.upload_file(file_path, folder)
-            
-            if 'error' in result:
-                print(f"✗ Failed to upload {file_path.name}: {result['error']}")
-                if 'raw_response' in result:
-                    print(f"Server response: {result['raw_response']}")
-            elif result.get('success'):
-                print(f"✓ Uploaded {result.get('filename', file_path.name)} to {result.get('path', 'unknown path')}")
-            else:
-                print(f"✗ Failed to upload {file_path.name}: {result.get('message', 'Unknown error')}")
-    
-    def list_files(self, folder: str = None, recursive: bool = False):
-        """List files on the site"""
-        if not self.ensure_authenticated():
-            return
-        
-        result = self.api.list_files(folder, recursive)
-        
-        if 'error' in result:
-            print(f"Error: {result['error']}")
-            if 'raw_response' in result:
-                print(f"Server response: {result['raw_response']}")
-            return
-        
-        if result.get('success'):
-            files = result.get('files', [])
-            if not files:
-                print("No files found")
-                return
-            
-            print(f"Files in {'/' + folder if folder else 'root'}:")
-            for file_info in files:
-                size = file_info.get('size')
-                if size is not None and isinstance(size, (int, float)):
-                    if size < 1024:
-                        size_str = f"{size:,} bytes"
-                    else:
-                        size_str = f"{size/1024:.1f} KB"
-                else:
-                    size_str = "unknown size"
-                
-                file_path = file_info.get('path', file_info.get('name', 'unknown'))
-                print(f"  {file_path} ({size_str})")
-        else:
-            print(f"Error: {result.get('message', 'Unknown error')}")
-    
-    def delete(self, paths: List[str]):
-        """Delete files from the site"""
-        if not self.ensure_authenticated():
-            return
-        
-        for path in paths:
-            result = self.api.delete_file(path)
-            
-            if 'error' in result:
-                print(f"✗ Failed to delete {path}: {result['error']}")
-                if 'raw_response' in result:
-                    print(f"Server response: {result['raw_response']}")
-            elif result.get('success'):
-                print(f"✓ Deleted {path}")
-            else:
-                print(f"✗ Failed to delete {path}: {result.get('message', 'Unknown error')}")
+    def upload_one(self, file_path, folder=None, overwrite=True):
+        with open(file_path, "rb") as fh:
+            files = {"file": (Path(file_path).name, fh.read())}
+        data = {"overwrite": "true" if overwrite else "false"}
+        if folder:
+            data["folder"] = folder
+        return self._parse(self.session.post(self._url("/api/upload"), files=files, data=data))
 
-def print_banner():
-    """Print the Reocities CLI banner"""
-    print("""
- ____                _ _   _           
-|  _ \ ___  ___   ___(_) |_(_) ___  ___ 
+    def upload_bulk(self, batch, folder=None, overwrite=True):
+        # batch is a list of (local_path, remote_name). The server reads $_FILES['files']
+        # as an array, so every part must use the same "files[]" field name - a list of
+        # tuples does that; a dict would collapse them to one entry.
+        if len(batch) > BULK_BATCH_SIZE:
+            raise ValueError(f"max {BULK_BATCH_SIZE} files per bulk upload")
+        parts = []
+        for local_path, remote_name in batch:
+            parts.append(("files[]", (remote_name, Path(local_path).read_bytes())))
+        data = {"overwrite": "true" if overwrite else "false"}
+        if folder:
+            data["folder"] = folder
+        return self._parse(self.session.post(self._url("/api/bulk-upload"), files=parts, data=data))
+
+    def list_dir(self, path=None, recursive=False):
+        params = {}
+        if path:
+            params["path"] = path
+        if recursive:
+            params["recursive"] = "true"
+        return self._parse(self.session.get(self._url("/api/files"), params=params))
+
+    def read_file(self, path):
+        """Return raw bytes of a remote file, or None on failure."""
+        params = {"action": "read", "path": path, "download": "1"}
+        response = self.session.get(self._url("/api/files"), params=params)
+        if response.status_code >= 400:
+            return None
+        return response.content
+
+    def delete(self, path):
+        return self._parse(self.session.delete(self._url("/api/files"),
+                                               json={"path": path}))
+
+    def make_folder(self, name, parent=None):
+        data = {"name": name}
+        if parent:
+            data["parent"] = parent
+        return self._parse(self.session.post(self._url("/api/folders"), data=data))
+
+
+# --- helpers -------------------------------------------------------------
+
+def load_ignore_patterns(directory):
+    patterns = []
+    for name in IGNORE_FILES:
+        ignore_file = directory / name
+        if not ignore_file.exists():
+            continue
+        for line in ignore_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                patterns.append(line)
+    return patterns
+
+
+def is_ignored(file_path, base_dir, patterns):
+    rel = file_path.relative_to(base_dir).as_posix()
+    for pattern in patterns:
+        if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(file_path.name, pattern):
+            return True
+    # Never ship the version-control directory.
+    return ".git/" in rel + "/" or rel.startswith(".git")
+
+
+def collect_files(directory):
+    patterns = load_ignore_patterns(directory)
+    found = []
+    for path in sorted(directory.rglob("*")):
+        if path.is_file() and not is_ignored(path, directory, patterns):
+            found.append((path, path.relative_to(directory).as_posix()))
+    return found
+
+
+def flatten_tree(entries, into=None):
+    """Turn the server's nested directory listing into a flat list of file entries."""
+    into = into if into is not None else []
+    for entry in entries:
+        if entry.get("type") == "directory":
+            flatten_tree(entry.get("children", []), into)
+        else:
+            into.append(entry)
+    return into
+
+
+def human_size(size):
+    if not isinstance(size, (int, float)):
+        return "?"
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def fail(message):
+    print(f"error: {message}", file=sys.stderr)
+    return 1
+
+
+# --- commands ------------------------------------------------------------
+
+def resolve_credentials(args):
+    """Order of precedence: CLI flag, environment, saved config."""
+    cfg = Config().read()
+    api_key = args.api_key or os.environ.get("REOCITIES_API_KEY") or cfg.get("api_key")
+    base_url = (args.base_url or os.environ.get("REOCITIES_BASE_URL")
+                or cfg.get("base_url") or DEFAULT_BASE_URL)
+    return api_key, base_url
+
+
+def require_client(args):
+    api_key, base_url = resolve_credentials(args)
+    if not api_key:
+        print("error: not logged in - run 'reocities login <api-key>' "
+              "or set REOCITIES_API_KEY", file=sys.stderr)
+        return None
+    return Client(api_key, base_url)
+
+
+def cmd_login(args):
+    base_url = args.base_url or os.environ.get("REOCITIES_BASE_URL") or DEFAULT_BASE_URL
+    client = Client(args.api_key, base_url)
+    result = client.list_dir()
+    if "error" in result:
+        return fail(f"login failed: {result['error']}")
+    Config().write(args.api_key, base_url)
+    print(f"logged in to {base_url}")
+    return 0
+
+
+def cmd_logout(args):
+    print("logged out" if Config().clear() else "not logged in")
+    return 0
+
+
+def cmd_push(args):
+    client = require_client(args)
+    if not client:
+        return 1
+    directory = Path(args.directory).resolve()
+    if not directory.is_dir():
+        return fail(f"not a directory: {args.directory}")
+
+    files = collect_files(directory)
+    if not files:
+        print("nothing to upload")
+        return 0
+
+    print(f"{len(files)} file(s) from {directory}")
+    if args.dry_run:
+        for _, remote in files:
+            print(f"  would upload {remote}")
+        return 0
+
+    # The bulk endpoint stores every file in one folder and keeps only the
+    # basename, so group by parent directory to preserve the tree.
+    groups = {}
+    for local_path, remote in files:
+        folder, _, name = remote.rpartition("/")
+        groups.setdefault(folder, []).append((local_path, name))
+
+    uploaded = failed = 0
+    for folder in sorted(groups):
+        items = groups[folder]
+        for start in range(0, len(items), BULK_BATCH_SIZE):
+            batch = items[start:start + BULK_BATCH_SIZE]
+            result = client.upload_bulk(batch, folder=folder or None,
+                                        overwrite=not args.no_overwrite)
+            if "error" in result:
+                print(f"  batch failed ({folder or '/'}): {result['error']}")
+                failed += len(batch)
+                continue
+            for item in result.get("uploaded", []):
+                print(f"  + {item.get('path', item.get('filename', '?'))}")
+                uploaded += 1
+            for item in result.get("failed", []):
+                print(f"  ! {item.get('filename', '?')}: {item.get('error', 'failed')}")
+                failed += 1
+    print(f"done: {uploaded} uploaded, {failed} failed")
+    return 1 if failed else 0
+
+
+def cmd_upload(args):
+    client = require_client(args)
+    if not client:
+        return 1
+    failed = 0
+    for name in args.files:
+        path = Path(name)
+        if not path.is_file():
+            print(f"  ! {name}: not a file")
+            failed += 1
+            continue
+        result = client.upload_one(path, args.folder, overwrite=not args.no_overwrite)
+        if result.get("success"):
+            print(f"  + {result.get('path', path.name)}")
+        else:
+            print(f"  ! {path.name}: {result.get('error', result.get('message', 'failed'))}")
+            failed += 1
+    return 1 if failed else 0
+
+
+def cmd_list(args):
+    client = require_client(args)
+    if not client:
+        return 1
+    result = client.list_dir(args.folder, recursive=args.recursive)
+    if "error" in result:
+        return fail(result["error"])
+    entries = result.get("files", [])
+    if args.recursive:
+        entries = flatten_tree(entries)
+    if not entries:
+        print("(empty)")
+        return 0
+    for entry in entries:
+        if entry.get("type") == "directory":
+            print(f"  {entry['path']}/")
+        else:
+            print(f"  {entry.get('path', entry.get('name'))}  ({human_size(entry.get('size'))})")
+    return 0
+
+
+def cmd_cat(args):
+    client = require_client(args)
+    if not client:
+        return 1
+    content = client.read_file(args.path)
+    if content is None:
+        return fail(f"could not read {args.path}")
+    sys.stdout.buffer.write(content)
+    return 0
+
+
+def cmd_pull(args):
+    client = require_client(args)
+    if not client:
+        return 1
+    dest = Path(args.directory).resolve()
+    result = client.list_dir(args.folder, recursive=True)
+    if "error" in result:
+        return fail(result["error"])
+    files = flatten_tree(result.get("files", []))
+    if not files:
+        print("nothing to download")
+        return 0
+    saved = failed = 0
+    for entry in files:
+        remote = entry.get("path") or entry.get("name")
+        content = client.read_file(remote)
+        if content is None:
+            print(f"  ! {remote}: download failed")
+            failed += 1
+            continue
+        local = dest / remote
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_bytes(content)
+        print(f"  + {remote}")
+        saved += 1
+    print(f"done: {saved} downloaded, {failed} failed -> {dest}")
+    return 1 if failed else 0
+
+
+def cmd_delete(args):
+    client = require_client(args)
+    if not client:
+        return 1
+    failed = 0
+    for path in args.paths:
+        result = client.delete(path)
+        if result.get("success"):
+            print(f"  - {path}")
+        else:
+            print(f"  ! {path}: {result.get('error', result.get('message', 'failed'))}")
+            failed += 1
+    return 1 if failed else 0
+
+
+def cmd_mkdir(args):
+    client = require_client(args)
+    if not client:
+        return 1
+    result = client.make_folder(args.name, args.parent)
+    if result.get("success"):
+        print(f"created {args.parent + '/' if args.parent else ''}{args.name}")
+        return 0
+    return fail(result.get("error", result.get("message", "failed")))
+
+
+def cmd_whoami(args):
+    client = require_client(args)
+    if not client:
+        return 1
+    result = client.list_dir(recursive=True)
+    if "error" in result:
+        return fail(result["error"])
+    files = flatten_tree(result.get("files", []))
+    total = sum(f.get("size") or 0 for f in files)
+    print(f"server:  {client.base_url}")
+    print(f"files:   {len(files)}")
+    print(f"storage: {human_size(total)}")
+    return 0
+
+
+def cmd_open(args):
+    _, base_url = resolve_credentials(args)
+    webbrowser.open(base_url)
+    print(f"opening {base_url}")
+    return 0
+
+
+def cmd_version(args):
+    print(f"reocities-cli {__version__}")
+    return 0
+
+
+BANNER = r"""
+ ____                _ _   _
+|  _ \ ___  ___   ___(_) |_(_) ___  ___
 | |_) / _ \/ _ \ / __| | __| |/ _ \/ __|
-|  _ <  __/ (_) | (__| | |_| |  __/\__ \\
+|  _ <  __/ (_) | (__| | |_| |  __/\__ \
 |_| \_\___|\___/ \___|_|\__|_|\___||___/
-                                       
-Reocities CLI - Manage your site from the command line
-""")
+
+Manage your Reocities site from the command line.
+"""
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="reocities", description="Reocities CLI")
+    parser.add_argument("--api-key", help="API key (overrides config and env)")
+    parser.add_argument("--base-url", help="API base URL (for self-hosted instances)")
+    sub = parser.add_subparsers(dest="command")
+
+    p = sub.add_parser("login", help="save an API key")
+    p.add_argument("api_key")
+    p.set_defaults(func=cmd_login)
+
+    sub.add_parser("logout", help="remove the saved API key").set_defaults(func=cmd_logout)
+
+    p = sub.add_parser("push", help="upload a whole directory")
+    p.add_argument("directory", nargs="?", default=".")
+    p.add_argument("--dry-run", action="store_true", help="list what would upload, send nothing")
+    p.add_argument("--no-overwrite", action="store_true", help="skip files that already exist")
+    p.set_defaults(func=cmd_push)
+
+    p = sub.add_parser("upload", help="upload one or more files")
+    p.add_argument("files", nargs="+")
+    p.add_argument("--folder", help="target folder on the site")
+    p.add_argument("--no-overwrite", action="store_true")
+    p.set_defaults(func=cmd_upload)
+
+    p = sub.add_parser("list", help="list files on the site")
+    p.add_argument("--folder", help="folder to list (default: root)")
+    p.add_argument("--recursive", action="store_true")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("cat", help="print a remote file to stdout")
+    p.add_argument("path")
+    p.set_defaults(func=cmd_cat)
+
+    p = sub.add_parser("pull", help="download the site to a local directory")
+    p.add_argument("directory", nargs="?", default=".")
+    p.add_argument("--folder", help="only download this folder")
+    p.set_defaults(func=cmd_pull)
+
+    p = sub.add_parser("delete", help="delete files or folders")
+    p.add_argument("paths", nargs="+")
+    p.set_defaults(func=cmd_delete)
+
+    p = sub.add_parser("mkdir", help="create a folder")
+    p.add_argument("name")
+    p.add_argument("--parent", help="parent folder")
+    p.set_defaults(func=cmd_mkdir)
+
+    sub.add_parser("whoami", help="show the active site and storage use").set_defaults(func=cmd_whoami)
+    sub.add_parser("open", help="open the site in a browser").set_defaults(func=cmd_open)
+    sub.add_parser("version", help="show the version").set_defaults(func=cmd_version)
+    return parser
+
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Reocities CLI - Command line interface for managing your Reocities site',
-        prog='reocities'
-    )
-    
-    subparsers = parser.add_subparsers(dest='command', help='Available commands')
-    
-    login_parser = subparsers.add_parser('login', help='Login with your API key')
-    login_parser.add_argument('api_key', help='Your Reocities API key')
-    
-    subparsers.add_parser('logout', help='Remove stored API key')
-    
-    push_parser = subparsers.add_parser('push', help='Upload entire directory to your site')
-    push_parser.add_argument('directory', nargs='?', default='.', help='Directory to upload (default: current directory)')
-    
-    upload_parser = subparsers.add_parser('upload', help='Upload individual files')
-    upload_parser.add_argument('files', nargs='+', help='Files to upload')
-    upload_parser.add_argument('--folder', help='Target folder on site')
-    
-    list_parser = subparsers.add_parser('list', help='List files on your site')
-    list_parser.add_argument('--folder', help='Specific folder to list')
-    list_parser.add_argument('--recursive', action='store_true', help='Include subdirectories')
-    
-    delete_parser = subparsers.add_parser('delete', help='Delete files from your site')
-    delete_parser.add_argument('paths', nargs='+', help='Paths to delete')
-    
-    subparsers.add_parser('version', help='Show version information')
-    
+    parser = build_parser()
     args = parser.parse_args()
-    
-    if not args.command:
-        print_banner()
+    if not getattr(args, "command", None):
+        print(BANNER)
         parser.print_help()
-        return
-    
-    cli = ReocitiesCLI()
-    
-    if args.command == 'login':
-        cli.login(args.api_key)
-    elif args.command == 'logout':
-        cli.logout()
-    elif args.command == 'push':
-        cli.push(args.directory)
-    elif args.command == 'upload':
-        cli.upload(args.files, args.folder)
-    elif args.command == 'list':
-        cli.list_files(args.folder, args.recursive)
-    elif args.command == 'delete':
-        cli.delete(args.paths)
-    elif args.command == 'version':
-        print(f"Reocities CLI version {__version__}")
+        return 0
+    try:
+        return args.func(args)
+    except requests.RequestException as exc:
+        return fail(f"network error: {exc}")
+    except KeyboardInterrupt:
+        return 130
 
-if __name__ == '__main__':
-    main()
+
+if __name__ == "__main__":
+    sys.exit(main())
