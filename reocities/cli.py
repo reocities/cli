@@ -13,8 +13,6 @@ import requests
 
 __version__ = "2.0.0"
 
-# Use the canonical www host. reocities.xyz 301-redirects to www, and a 301 turns
-# a POST upload into a GET, which the API rejects - so target www directly.
 DEFAULT_BASE_URL = "https://www.reocities.xyz"
 BULK_BATCH_SIZE = 10
 IGNORE_FILES = (".gitignore", ".reocitiesignore")
@@ -246,8 +244,6 @@ def cmd_push(args):
             print(f"  would upload {remote}")
         return 0
 
-    # The bulk endpoint stores every file in one folder and keeps only the
-    # basename, so group by parent directory to preserve the tree.
     groups = {}
     for local_path, remote in files:
         folder, _, name = remote.rpartition("/")
@@ -466,7 +462,7 @@ def build_parser():
     p.add_argument("--parent", help="parent folder")
     p.set_defaults(func=cmd_mkdir)
 
-    sub.add_parser("whoami", help="show the active site and storage use").set_defaults(func=cmd_whoami)
+    sub.add_parser("whoami", help="show the active site and storage usage").set_defaults(func=cmd_whoami)
     sub.add_parser("open", help="open the site in a browser").set_defaults(func=cmd_open)
     sub.add_parser("version", help="show the version").set_defaults(func=cmd_version)
     return parser
